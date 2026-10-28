@@ -188,7 +188,11 @@ def get_args_parser():
     parser.add_argument(
         '--vmamba_pretrained_model',
         type=str,
-        default='checkpoints/vmamba_checkpoints/vssmsmall_dp03_ckpt_epoch_238.pth',
+        # NOTE: the directory on disk is spelled `vmamba_chekcpoints` (typo kept from the
+        # original release). The old default `vmamba_checkpoints` silently failed to load,
+        # which meant the VSSM backbone started from random init. Do not "fix" the typo
+        # without also renaming the folder.
+        default='checkpoints/vmamba_chekcpoints/vssmsmall_dp03_ckpt_epoch_238.pth',
         help='The checkpoint path for Vmamba backbone; if not specified, the model will be loaded from ImageNet pretrained weights'
     )
 
