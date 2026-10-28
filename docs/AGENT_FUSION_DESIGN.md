@@ -172,7 +172,8 @@ for l in 1..L:                                            # L=3
 | P3 | 训练喂 `aug_image`，测试喂原图 | train/test 分布不一致 | 建议 `p=0.5` 概率用增强图，或干脆只喂原图 |
 | P4 | Thermal 用 `L→RGB` 复制三通道且**不做 ImageNet 归一化**，与 RGB 预处理不一致 | 两路输入统计量不同，共享 VSSM 时更明显 | 对 T 单独做一次标准化（均值/方差来自训练集），或统一归一化 |
 | P5 | `stage3_adapter_every` 默认 0 → stage3 内层 adapter 全部闲置 | 模块闲置，白占显存 | 保持 0，作为消融项 |
-| P6 | 无 git 仓库 | 改动无法回溯，实验不可复现 | **第一步就 `git init`** |
+| P6 | 无 git 仓库 | 改动无法回溯，实验不可复现 | ✅ 已 `git init` 并推送 `sod-agent` |
+| P9 | `option.py` 的 `vmamba_pretrained_model` 指向 `checkpoints/vmamba_checkpoints/`，实际目录是 `checkpoints/vmamba_chekcpoints/`（**拼写不一致**） | 现在重新训练会**静默丢掉了 ImageNet 预训练的 VSSM**，从随机初始化开始（只打印一行 "Failed loading checkpoint"） | **必须修**：改默认路径或重命名目录。已验证发布的 `best_epoch_rgbt_final.pth` 里 VSSM 权重与预训练权重 **cos=0.9997~1.0000**，说明当初训练时是加载成功的，只是现在路径坏了 |
 | P7 | 无 RGB-D 数据 | "D 作为考虑"只能停留在设计层 | 见 §5 阶段 5（可选） |
 | P8 | `test()` 里 `(res - res.min())/(res.max()-res.min())` 逐图 min-max | 破坏阈值语义，但对 rank-based 指标影响小 | 保留，但记录 |
 
@@ -219,31 +220,42 @@ python -c "import torch;print(torch.__version__, torch.cuda.get_device_capabilit
 
 > 代价：env 里残留 rfdetr 的无关包（ultralytics 等），但 `docs/env_versions.txt` 已完整记录，可复现性不受影响。
 
-### 2.4 编译 selective_scan（**当前唯一未完成项**）
+### 2.4 编译 selective_scan（**已完成，2026-10-28**）
 
-系统里只有 **CUDA 13.0**（`/usr/local/cuda`），而 torch 2.9.1 是 cu128，torch 的版本闸门会硬报错：
+实际跑通的路径（**注意：pip 的 nvidia-cuda-nvcc-cu12 里没有 nvcc 二进制，只有 ptxas，所以合成 CUDA_HOME 这条路走不通**）：
 
-```
-RuntimeError: The detected CUDA version (13.0) mismatches the version that was used to compile PyTorch (12.8)
-```
-
-两条可行路径（按推荐度）：
-
-**路径 A（推荐）**：装 pip 版 nvcc 12.8，拼一个合成 `CUDA_HOME`
 ```bash
-pip install -i https://mirrors.aliyun.com/pypi/simple/ nvidia-cuda-nvcc-cu12==12.8.93
-NV=$CONDA_PREFIX/lib/python3.10/site-packages/nvidia
-mkdir -p ~/cuda128/{bin,include,lib64}
-ln -sf $NV/cuda_nvcc/bin/nvcc ~/cuda128/bin/nvcc
-ln -sf $NV/cuda_nvcc/include/* ~/cuda128/include/     # crt 等
-ln -sf $NV/cuda_runtime/include/* ~/cuda128/include/
-ln -sf $NV/cuda_runtime/lib/* ~/cuda128/lib64/
-export CUDA_HOME=$HOME/cuda128
+# 1) 通过 Clash 代理装 CUDA 12.8 的 nvcc + cudart/cuSPARSE 头文件（不需要 4GB 全套）
+export http_proxy=http://127.0.0.1:7890 https_proxy=$http_proxy
+curl -fsSL -o /tmp/cuda-keyring.deb \
+  https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+dpkg -i /tmp/cuda-keyring.deb && apt-get update
+apt-get install -y cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cccl-12-8 \
+                   libcusparse-dev-12-8 libcublas-dev-12-8 libcusolver-dev-12-8
+
+# 2) 关键补丁：setup.py 原本硬编码 sm_70/80/90，必须加 sm_120
+#    Vmamba/models/encoders/selective_scan/setup.py
+#    if bare_metal_version >= Version("12.8"):
+#        cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
+
+# 3) 编译
+conda activate atf
+export CUDA_HOME=/usr/local/cuda-12.8 TORCH_CUDA_ARCH_LIST=12.0 MAX_JOBS=8
+cd Vmamba/models/encoders/selective_scan && pip install -e . --no-build-isolation --no-deps
+python -c "import torch, selective_scan_cuda_core; print('ok')"   # 必须先 import torch
 ```
 
-**路径 B**：装 CUDA 12.8 官方 runfile（`cuda_12.8.1_570.124.06_linux.run --toolkit --silent`），~4 GB 下载。
+**踩坑记录**
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| 系统只有 CUDA 13.0 | `CUDA version (13.0) mismatches ... (12.8)` | apt 装 12.8 |
+| `pip nvidia-cuda-nvcc-cu12` | 只有 `bin/ptxas`，**没有 nvcc** | 放弃合成 CUDA_HOME |
+| 缺 `cusparse.h` | `CUDAContextLight.h` 编译失败 | 装 `libcusparse-dev-12-8` |
+| setup.py 硬编码架构 | 编译出 sm_70/80/90，运行时 `no kernel image is available` | 打补丁加 sm_120 |
+| 无 ninja | 回退 distutils，编译极慢 | `pip install ninja` |
 
-然后用 `scripts/build_selective_scan.sh 12.0` 编译。
+**冒烟测试结果**（`scripts/smoke_test.py`，384×384，batch=1）：
+`selective_scan OK` → 172.1M 参数 → 前向 **0.69 s**，峰值显存 **1.37 GiB**，四路输出形状与 §1.2 完全一致。
 
 ### 2.5 回退方案（如果编译失败）
 
