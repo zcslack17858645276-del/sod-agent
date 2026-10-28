@@ -1,0 +1,42 @@
+__pycache__/
+*.py[cod]
+.vscode/
+.history/
+.idea/
+
+# --- data / weights (never commit) ---
+checkpoints/
+datasets/
+res_checkpoints/
+final_pth/
+output/
+pred/
+runs/
+cache/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# --- build artifacts ---
+build/
+*.so
+*.o
+*.egg-info/
+selective_scan.egg-info/
+
+# --- archives / installers ---
+*.zip
+*.rar
+*.7z
+*.whl
+*.tar
+*.tar.gz
+cam_out.zip
+final_pth.zip
+mamba_ssm-2.2.4+cu12torch2.2cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
+
+# --- logs ---
+*.log
+log.txt
+nohup.out
