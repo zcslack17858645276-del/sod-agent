@@ -1,163 +1,124 @@
-"""Standalone evaluation for a trained checkpoint: S-measure / MAE / E-measure / Fw-beta.
+"""Batch evaluation wrapper around the *existing* repo pipeline.
 
-This is intentionally separate from `train.py::test()`, which stays as the cheap
-per-epoch S-measure probe used for model selection.  Use this file when you want the
-full four-metric table for a finished checkpoint.
+Nothing about the metric is re-implemented here: inference matches
+`sam2/tools/output_maps.py` line for line (same `test_dataset`, same `np.round`,
+same `./pred/<root>/` layout), and scoring is delegated to
+`metric/test_metric.evaluation_metric` — the very function `metric/metric_model.py`
+calls. With no flags this must reproduce the original numbers exactly.
 
-Usage
------
-    python eval.py --checkpoint res_checkpoints/final_pth/best_epoch_rgbt_final.pth
-    python eval.py -c <ckpt> --datasets VT5000 VT1000 VT821 --tta
-    python eval.py -c <ckpt> --limit 200 --save-pred preds/   # quick sanity check
+The only additions are convenience switches needed for A/B experiments:
+    --datasets   pick which test sets to run (default: the three RGB-T sets)
+    --limit      stop after N images (debugging)
+    --tta        horizontal-flip test-time augmentation (averaged probabilities)
+    --json       dump the returned dict to a json file
 
-Outputs a table and, with --json, a machine-readable dump.
+Usage:
+    python eval.py -c res_checkpoints/final_pth/best_epoch_rgbt_final.pth
+    python eval.py -c <ckpt> --datasets VT821 --tta --json results/x.json
 """
-from __future__ import annotations
-
 import argparse
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from dataset_config import get_test_sets
-from datasets.get_data import get_test_loader
-from metric.metric import Emeasure, MAE, Smeasure, WeightedFmeasure, Fmeasure
+from datasets.get_data import test_dataset
+from metric.test_metric import evaluation_metric
 from option import get_args_parser
 from sam2.sam2_model.build_backbone_ours import Model
 
+ROOT = Path(__file__).resolve().parent
+DEFAULT_SETS = ["VT5000/Test", "VT1000", "VT821"]
 
-def build_model(opt, checkpoint: str, device):
-    # option.py uses argparse.parse_args(); feed it a clean argv so eval flags never leak in.
-    old_argv = sys.argv
-    sys.argv = [old_argv[0]]
+
+def load_model(ckpt: str):
+    argv = sys.argv
+    sys.argv = [argv[0]]
     try:
-        cfg = get_args_parser()
+        opt = get_args_parser()
     finally:
-        sys.argv = old_argv
-    cfg.input_size = opt.size
-
-    model = Model(cfg)
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if isinstance(state, dict) and "model" in state and not any(k.startswith("vmamba") for k in state):
-        state = state["model"]
-    # load before .to(device): SAMFusion uses nn.LazyConv2d, whose parameters only
-    # materialise when the state dict (or a forward pass) provides their shape.
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print(f"[warn] {len(missing)} missing keys, e.g. {missing[:3]}")
-    if unexpected:
-        print(f"[warn] {len(unexpected)} unexpected keys, e.g. {unexpected[:3]}")
-    model = model.to(device).eval()
-    return model
+        sys.argv = argv
+    model = Model(opt, verbose=False)
+    model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+    for p in model.parameters():
+        p.requires_grad_(False)
+    model.cuda().eval()
+    return model, opt
 
 
-@torch.no_grad()
-def forward_prob(model, image, modality, out_hw, tta: bool):
-    logits = model(image, modality)[0]
-    probs = []
-    for flip in ([False, True] if tta else [False]):
-        x, m = (image.flip(-1), modality.flip(-1)) if flip else (image, modality)
-        out = model(x, m)[0] if flip else logits
-        if flip:
-            out = out.flip(-1)
-        out = F.interpolate(out, size=out_hw, mode="bilinear", align_corners=False)
-        p = out.sigmoid()
-        p = (p - p.min()) / (p.max() - p.min() + 1e-8)
-        probs.append(p)
-    return torch.stack(probs, 0).mean(0)
-
-
-def evaluate(model, loader, device, size, tta, save_dir=None, limit=None, verbose=False):
-    sm, mae, em, wfm, fm = Smeasure(), MAE(), Emeasure(), WeightedFmeasure(), Fmeasure()
+@torch.inference_mode()
+def infer_to_dir(model, loader, out_dir, tta=False, limit=0):
+    """Exactly `output_maps.py`: forward -> interpolate -> sigmoid -> minmax -> round -> png."""
+    os.makedirs(out_dir, exist_ok=True)
     n = 0
-    t0 = time.time()
-    for pack in tqdm(loader, desc="eval", ncols=80, disable=not verbose):
-        image, _, modality, gt, name = pack
-        image = image.to(device, non_blocking=True)
-        modality = modality.to(device, non_blocking=True)
-        out_hw = (gt.shape[-2], gt.shape[-1])
+    for _ in tqdm(range(loader.size), desc=os.path.basename(out_dir.rstrip("/")), ncols=80):
+        image, modality, gt_hw, name = loader.load_data_for_inference()
+        image = image.cuda(non_blocking=True)
+        modality = modality.cuda(non_blocking=True)
 
-        prob = forward_prob(model, image, modality, out_hw, tta)
-        # EXACTLY match sam2/tools/output_maps.py: np.round, not truncation.
-        # The E/F metrics are surprisingly sensitive to this +/-1/255 quantisation
-        # (the adaptive threshold inside metric/utils.prepare_data amplifies it),
-        # so round vs trunc changes adpF by ~1 point. Keep it identical.
-        pred_np = np.round(prob[0, 0].clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+        res = model(image, modality)
+        if isinstance(res, (tuple, list)):
+            res = res[0]
+        res = F.interpolate(res, size=gt_hw, mode="bilinear", align_corners=False).sigmoid()
 
-        gt_255 = np.asarray(gt[0].cpu().numpy() * 255.0).astype(np.uint8)
-        sm.step(pred_np, gt_255)
-        mae.step(pred_np, gt_255)
-        em.step(pred_np, gt_255)
-        wfm.step(pred_np, gt_255)
-        fm.step(pred_np, gt_255)
+        if tta:
+            res2 = model(image.flip(-1), modality.flip(-1))
+            if isinstance(res2, (tuple, list)):
+                res2 = res2[0]
+            res2 = F.interpolate(res2, size=gt_hw, mode="bilinear", align_corners=False).sigmoid().flip(-1)
+            res = 0.5 * (res + res2)
 
-        if save_dir:
-            from PIL import Image
-
-            Path(save_dir).mkdir(parents=True, exist_ok=True)
-            Image.fromarray(pred_np).save(os.path.join(save_dir, name[0]))
+        res = res.float().cpu().numpy().squeeze()
+        res = (res - res.min()) / (res.max() - res.min() + 1e-8)
+        cv2.imwrite(os.path.join(out_dir, name), np.round(res * 255).astype(np.uint8))
         n += 1
         if limit and n >= limit:
             break
-
-    res = {
-        "n": n,
-        "S": float(sm.get_results()["sm"]),
-        "MAE": float(mae.get_results()["mae"]),
-        "E": float(em.get_results()["em"]["adp"]),
-        "Fw": float(wfm.get_results()["wfm"]),
-        "Fb": float(fm.get_results()["fm"]["adp"]),
-        "seconds": round(time.time() - t0, 1),
-    }
-    return res
+    return n
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-c", "--checkpoint", required=True)
-    ap.add_argument("--datasets", nargs="*", default=None, help="default: TEST_DATASETS in dataset_config.py")
-    ap.add_argument("--size", type=int, default=384)
-    ap.add_argument("--limit", type=int, default=0, help="evaluate only the first N images (debug)")
-    ap.add_argument("--tta", action="store_true", help="horizontal-flip test-time augmentation")
-    ap.add_argument("--save-pred", default=None, help="directory to dump predicted masks")
-    ap.add_argument("--json", default=None, help="dump results to this json file")
-    ap.add_argument("-v", "--verbose", action="store_true", help="show the progress bar")
-    opt = ap.parse_args()
+    ap.add_argument("-c", "--checkpoint", default="res_checkpoints/final_pth/best_epoch_rgbt_final.pth")
+    ap.add_argument("--datasets", nargs="+", default=DEFAULT_SETS)
+    ap.add_argument("--pred-dir", default="pred")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--tta", action="store_true")
+    ap.add_argument("--json", default=None)
+    a = ap.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device}  ckpt={opt.checkpoint}  size={opt.size}  tta={opt.tta}")
-    model = build_model(opt, opt.checkpoint, device)
+    model, opt = load_model(a.checkpoint)
+    print(f"ckpt={a.checkpoint}  size={opt.input_size}  tta={a.tta}")
 
-    test_sets = get_test_sets(opt.datasets)
-    results = {}
-    for ts in test_sets:
-        loader = get_test_loader(
-            str(ts["im_root"]), str(ts["gt_root"]),
-            modality_root=str(ts["modality_root"]),
-            testsize=opt.size, batchsize=1, num_workers=4,
-        )
-        save_dir = os.path.join(opt.save_pred, ts["name"]) if opt.save_pred else None
-        r = evaluate(model, loader, device, opt.size, opt.tta,
-                     save_dir=save_dir, limit=opt.limit or None, verbose=opt.verbose)
-        results[ts["name"]] = r
-        print(f"[{ts['name']}] S={r['S']:.4f} MAE={r['MAE']:.4f} E={r['E']:.4f} "
-              f"Fw={r['Fw']:.4f} Fb={r['Fb']:.4f}  ({r['n']} imgs, {r['seconds']}s)")
+    out = {"checkpoint": a.checkpoint, "size": opt.input_size, "tta": a.tta, "results": {}}
+    for root in a.datasets:
+        im_dir = ROOT / "datasets" / "RGB-T" / root / "RGB"
+        gt_dir = ROOT / "datasets" / "RGB-T" / root / "GT"
+        t_dir = ROOT / "datasets" / "RGB-T" / root / "T"
+        if not im_dir.is_dir():
+            print(f"[skip] {root}: {im_dir} not found")
+            continue
 
-    if opt.json:
-        Path(opt.json).parent.mkdir(parents=True, exist_ok=True)
-        with open(opt.json, "w", encoding="utf-8") as f:
-            json.dump({"checkpoint": opt.checkpoint, "size": opt.size, "tta": opt.tta,
-                       "results": results}, f, indent=2, ensure_ascii=False)
-        print(f"saved -> {opt.json}")
+        loader = test_dataset(str(im_dir), str(gt_dir), modality_root=str(t_dir), testsize=opt.input_size)
+        pred_dir = ROOT / a.pred_dir / root
+        n = infer_to_dir(model, loader, str(pred_dir), tta=a.tta, limit=a.limit)
+
+        print(f"\n=== {root} ({n} imgs) ===")
+        r = evaluation_metric(str(gt_dir) + "/", str(pred_dir))
+        out["results"][root] = r
+
+    if a.json:
+        Path(a.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.json).write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"saved -> {a.json}")
 
 
 if __name__ == "__main__":
