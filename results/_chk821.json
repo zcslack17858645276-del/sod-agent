@@ -1,0 +1,16 @@
+{
+  "checkpoint": "res_checkpoints/final_pth/best_epoch_rgbt_final.pth",
+  "size": 384,
+  "tta": false,
+  "results": {
+    "VT821": {
+      "n": 821,
+      "S": 0.9461819966753547,
+      "MAE": 0.013655313730661003,
+      "E": 0.9680798042719232,
+      "Fw": 0.9211429950888613,
+      "Fb": 0.916199829984027,
+      "seconds": 123.0
+    }
+  }
+}

@@ -87,7 +87,11 @@ def evaluate(model, loader, device, size, tta, save_dir=None, limit=None, verbos
         out_hw = (gt.shape[-2], gt.shape[-1])
 
         prob = forward_prob(model, image, modality, out_hw, tta)
-        pred_np = (prob[0, 0].clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+        # EXACTLY match sam2/tools/output_maps.py: np.round, not truncation.
+        # The E/F metrics are surprisingly sensitive to this +/-1/255 quantisation
+        # (the adaptive threshold inside metric/utils.prepare_data amplifies it),
+        # so round vs trunc changes adpF by ~1 point. Keep it identical.
+        pred_np = np.round(prob[0, 0].clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
 
         gt_255 = np.asarray(gt[0].cpu().numpy() * 255.0).astype(np.uint8)
         sm.step(pred_np, gt_255)
